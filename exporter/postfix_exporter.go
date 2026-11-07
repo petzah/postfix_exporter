@@ -851,29 +851,39 @@ func (e *PostfixExporter) StartMetricCollection(ctx context.Context) {
 	gauge := e.postfixUp.WithLabelValues(e.logSrc.Path())
 	defer gauge.Set(0)
 
+	for {
+		line, err := e.readLogLine(ctx, gauge)
+		if err != nil {
+			if err != logsource.SystemdNoMoreEntries {
+				slog.Error("Couldn't read log source.", "source", e.logSrc.Path(), "error", err.Error())
+				return
+			}
+		}
+		e.CollectFromLogLine(line)
+		gauge.Set(1)
+	}
+}
+
+// readLogLine reads the next line, waiting out an unavailable log stream. The Kubernetes
+// source reopens its stream on the next Read, so giving up would leave the exporter blind
+// until restarted. Other errors are returned as they are. gauge is postfix_up for the log
+// source; it is 0 while waiting.
+func (e *PostfixExporter) readLogLine(ctx context.Context, gauge prometheus.Gauge) (string, error) {
 	delay := logReadRetryMin
 	for {
 		line, err := e.logSrc.Read(ctx)
-		switch {
-		case err == nil, err == logsource.SystemdNoMoreEntries:
-			e.CollectFromLogLine(line)
-			gauge.Set(1)
-			delay = logReadRetryMin
-		case errors.Is(err, logsource.ErrLogStreamUnavailable) && ctx.Err() == nil:
-			// The Kubernetes source reopens its stream on the next Read. Giving up here
-			// would leave the exporter blind until restarted.
-			gauge.Set(0)
-			slog.Warn("Log stream unavailable, retrying.", "source", e.logSrc.Path(), "error", err.Error(), "delay", delay)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(delay):
-			}
-			delay = min(delay*2, logReadRetryMax)
-		default:
-			slog.Error("Couldn't read log source.", "source", e.logSrc.Path(), "error", err.Error())
-			return
+		if !errors.Is(err, logsource.ErrLogStreamUnavailable) || ctx.Err() != nil {
+			return line, err
 		}
+
+		gauge.Set(0)
+		slog.Warn("Log stream unavailable, retrying.", "source", e.logSrc.Path(), "error", err.Error(), "delay", delay)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, logReadRetryMax)
 	}
 }
 
