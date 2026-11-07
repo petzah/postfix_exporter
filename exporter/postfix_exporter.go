@@ -854,27 +854,26 @@ func (e *PostfixExporter) StartMetricCollection(ctx context.Context) {
 	delay := logReadRetryMin
 	for {
 		line, err := e.logSrc.Read(ctx)
-		if err != nil && err != logsource.SystemdNoMoreEntries {
-			if !errors.Is(err, logsource.ErrLogStreamUnavailable) || ctx.Err() != nil {
-				slog.Error("Couldn't read log source.", "source", e.logSrc.Path(), "error", err.Error())
-				return
-			}
-			// The source reopens its stream on the next Read (the Kubernetes source while
-			// the API server or kubelet is unreachable). Giving up here would leave the
-			// exporter blind until restarted.
+		switch {
+		case err == nil, err == logsource.SystemdNoMoreEntries:
+			e.CollectFromLogLine(line)
+			gauge.Set(1)
+			delay = logReadRetryMin
+		case errors.Is(err, logsource.ErrLogStreamUnavailable) && ctx.Err() == nil:
+			// The Kubernetes source reopens its stream on the next Read. Giving up here
+			// would leave the exporter blind until restarted.
 			gauge.Set(0)
-			slog.Error("Couldn't read log source, retrying.", "source", e.logSrc.Path(), "error", err.Error(), "delay", delay)
+			slog.Warn("Log stream unavailable, retrying.", "source", e.logSrc.Path(), "error", err.Error(), "delay", delay)
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(delay):
 			}
 			delay = min(delay*2, logReadRetryMax)
-			continue
+		default:
+			slog.Error("Couldn't read log source.", "source", e.logSrc.Path(), "error", err.Error())
+			return
 		}
-		delay = logReadRetryMin
-		e.CollectFromLogLine(line)
-		gauge.Set(1)
 	}
 }
 
